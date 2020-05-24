@@ -74,7 +74,7 @@ impl Default for Config {
             },
             pkt_detect: PktDetectConfig {
                 num_samps: 128,
-                thresh: 2.,
+                thresh: 3.,
             },
             pkt: PktConfig {
                 num_data_bits: 256,
@@ -85,13 +85,13 @@ impl Default for Config {
     }
 }
 
-/// A moving window of the sum and std. dev. of values
+/// A moving window of the sum and std. dev. of the norm of the values
 /// inside. Recalculates the value to maintain precision
 pub struct WindowSum {
     /// Number of values in the window
     win_size: usize,
     /// The values currently in the window
-    vals: VecDeque<f32>,
+    vals: VecDeque<Complex<f32>>,
     /// Current sum of values in the window
     sum: f32,
     /// Current sum of square of values in the window
@@ -114,16 +114,20 @@ impl WindowSum {
 
     /// Push a new value into the window. If window already has
     /// win_size values, returns the outgoing value
-    fn push(&mut self, v: f32) -> Option<f32> {
+    fn push(&mut self, v: Complex<f32>) -> Option<Complex<f32>> {
         // Add in the new value
-        self.sum += v;
-        self.sum_sq += v * v;
+        self.sum += v.norm();
+        self.sum_sq += v.norm_sqr();
         self.vals.push_back(v);
         self.samps_since_last += 1;
 
-        if let Some(vo) = self.vals.front() {
-            self.sum -= vo;
-        }
+	assert!(self.vals.len() <= self.win_size);
+	if self.vals.len() == self.win_size {
+            if let Some(vo) = self.vals.front() {
+		self.sum -= vo.norm();
+		self.sum_sq -= vo.norm_sqr();
+            }
+	}
 
         // Pop if already full
         let res = if self.vals.len() == self.win_size {
@@ -134,8 +138,8 @@ impl WindowSum {
 
         // Recompute if necessary
         if self.samps_since_last > 65535 {
-            self.sum = self.vals.iter().sum();
-            self.sum_sq = self.vals.iter().map(|v| v * v).sum();
+            self.sum = self.vals.iter().map(|v| v.norm()).sum();
+            self.sum_sq = self.vals.iter().map(|v| v.norm_sqr()).sum();
             self.samps_since_last = 0;
         }
 
@@ -158,12 +162,27 @@ impl WindowSum {
         }
     }
 
-    /// Have >= `win_size` values been pushed?
-    #[allow(dead_code)]
-    fn full(&self) -> bool {
-        assert!(self.vals.len() <= self.win_size);
-        self.vals.len() == self.win_size
+    /// Give access to the underlying `VecDeqeue`
+    fn deque(&self) -> &VecDeque<Complex<f32>> {
+        &self.vals
     }
+}
+
+/// State machine state for the PktDetector
+enum PktDetectorState {
+    Silent,
+    /// We are currently recording samples for a packet
+    PktInProgress {
+        /// We'll add samples to this one-by-one as they are pushed
+        pkt_samps: Vec<Complex<f32>>,
+        /// Position in `pkt_samps` that is currently our best
+        /// candidate for the start of the packet
+        start_pos: usize,
+        /// Position (in `pkt_samps`) of the last indicator calculated
+        cur_pos: usize,
+        /// Maximum eligible indicator value for this packet
+        max_indicator: f32,
+    },
 }
 
 /// Takes a constant stream of packets and tells us exactly where a
@@ -172,6 +191,8 @@ pub struct PktDetector<'c> {
     config: &'c Config,
     /// Two sliding windows to do thresholding
     windows: (WindowSum, WindowSum),
+    /// State of the state machine for packet detector
+    state: PktDetectorState,
 }
 
 impl<'c> PktDetector<'c> {
@@ -181,6 +202,7 @@ impl<'c> PktDetector<'c> {
         Self {
             config,
             windows: (WindowSum::new(n), WindowSum::new(n)),
+            state: PktDetectorState::Silent,
         }
     }
 
@@ -188,7 +210,8 @@ impl<'c> PktDetector<'c> {
     fn indicator(&self) -> f32 {
         if self.windows.0.std_dev() == 0. {
             if self.windows.1.avg() > 0. {
-                std::f32::MAX
+                // The minimum value that'll pass the threshold
+                self.config.pkt_detect.thresh
             } else {
                 0.
             }
@@ -201,7 +224,7 @@ impl<'c> PktDetector<'c> {
     /// samples to start detecting packets
     fn push_samp(&mut self, samp: Complex<f32>) -> bool {
         // Put value in window
-        if let Some(samp) = self.windows.1.push(samp.norm()) {
+        if let Some(samp) = self.windows.1.push(samp) {
             if let Some(_) = self.windows.0.push(samp) {
                 // We need enough seed samples before we can start
                 // detecting packets
@@ -211,19 +234,64 @@ impl<'c> PktDetector<'c> {
         return false;
     }
 
-    /// Push samples one-by-one. When it returns true, send the next
-    /// >= `config.pkt_detect.thresh` samples to get the exact start
-    /// id of the packet. `pkt_start_index` must be called with the
-    /// samples immediately following the one where it returned
-    /// true. Following call to `pkt_start_index`, `push` can be
-    /// called again with the samples that come after
-    /// `pkt_start_index`
-    pub fn push(&mut self, samp: Complex<f32>) -> bool {
+    /// Push all samples one-by-one. Once it thinks it has received
+    /// all samples from a packet, returns a vec containing all the
+    /// samples
+    pub fn push(&mut self, samp: Complex<f32>) -> Option<Vec<Complex<f32>>> {
         if !self.push_samp(samp) {
-            return false;
+            return None;
         }
-        // Has the indicator met the threshold?
-        self.indicator() > self.config.pkt_detect.thresh
+        // The maximum number of samples per packet, including some
+        // slack for detecting the packet
+        let max_samples = self.config.samps_per_pkt() + self.config.pkt_detect.num_samps;
+        let indicator = self.indicator();
+        match self.state {
+            PktDetectorState::Silent => {
+                // if the indicator has met the threshold, change state
+                if indicator >= self.config.pkt_detect.thresh {
+                    let mut pkt_samps = Vec::with_capacity(max_samples);
+                    let (s1, s2) = self.windows.1.deque().as_slices();
+                    pkt_samps.push(*self.windows.0.deque().back().unwrap());
+                    pkt_samps.extend(s1);
+                    pkt_samps.extend(s2);
+                    assert!(pkt_samps.len() <= max_samples);
+                    // The current `indicator` value corresponds to the 0th sample here
+                    self.state = PktDetectorState::PktInProgress {
+                        pkt_samps,
+                        start_pos: 0,
+                        cur_pos: 0,
+                        max_indicator: indicator,
+                    };
+                }
+                None
+            }
+            PktDetectorState::PktInProgress {
+                ref mut pkt_samps,
+                ref mut start_pos,
+                ref mut cur_pos,
+                ref mut max_indicator,
+            } => {
+                if pkt_samps.len() < max_samples {
+                    pkt_samps.push(samp);
+                    *cur_pos += 1;
+                    // See if we need up update the indicator. We only
+                    // check for the first few samples, enough to
+                    // cover a window
+                    if pkt_samps.len() <= self.config.pkt_detect.num_samps
+                        && indicator > *max_indicator
+                    {
+                        *max_indicator = indicator;
+                        *start_pos = *cur_pos;
+                    }
+                    None
+                } else {
+                    // Remove the portion of `pkt_samples` before pkt starts
+                    let res = pkt_samps.split_off(*start_pos).clone();
+                    self.state = PktDetectorState::Silent;
+                    Some(res)
+                }
+            }
+        }
     }
 
     /// Given at-least `config.pkt_detect.num_samples` samples after
@@ -435,11 +503,15 @@ impl Iterator for TestTx {
 /// receiver
 pub struct TestLoopback<T: Iterator<Item = Complex<f32>>> {
     tx: T,
+    rng: rand_pcg::Pcg32,
 }
 
 impl<T: Iterator<Item = Complex<f32>>> TestLoopback<T> {
     pub fn new(tx: T) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            rng: rand_pcg::Pcg32::new(1, 1),
+        }
     }
 }
 
@@ -449,7 +521,11 @@ where
 {
     type Item = Complex<f32>;
     fn next(&mut self) -> Option<Complex<f32>> {
-        self.tx.next()
+        if let Some(val) = self.tx.next() {
+            Some(val + 0.1 * Complex::<f32>::new(self.rng.gen(), self.rng.gen()))
+        } else {
+            None
+        }
     }
 }
 
@@ -459,37 +535,15 @@ fn rx_loop<I: InputSampleStream>(inp: &mut I, config: &Config) {
     let mut pkt_detector = PktDetector::new(config);
     while let Some(sample) = inp.next() {
         // Do packet detection
-        if !pkt_detector.push(sample) {
+        let pkt_samps = if let Some(pkt_samps) = pkt_detector.push(sample) {
+            pkt_samps
+        } else {
             continue;
-        }
+        };
 
-        // Collect enough samples that they definitely contain the
-        // packet (if what we detected is indeed a packet)
-        let max_samples = config.samps_per_pkt() + config.pkt_detect.num_samps;
-        let mut pkt_samps = Vec::with_capacity(max_samples);
-        let mut inp_done = false;
-        for _ in 0..max_samples {
-            if let Some(sample) = inp.next() {
-                pkt_samps.push(sample);
-            } else {
-                inp_done = true;
-                break;
-            }
-        }
-        if inp_done {
-            break;
-        }
-
-        // Now find exactly where the packet started
-        let pkt_start_index = pkt_detector.pkt_start_index(&pkt_samps);
-        // Remove off the stuff before the packet starts
-        let pkt_samps = pkt_samps.split_off(pkt_start_index);
-
-        println!("{:?}", pkt_samps);
-        println!("Start index: {}", pkt_start_index);
+        println!("Packet detected");
 
         // Try to decode this packet
-        break;
     }
 }
 
