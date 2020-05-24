@@ -1,7 +1,7 @@
 use crate::config::Config;
 
-use std::collections::VecDeque;
 use num::Complex;
+use std::collections::VecDeque;
 
 /// A moving window of the sum and std. dev. of the norm of the values
 /// inside. Recalculates the value to maintain precision
@@ -39,17 +39,13 @@ impl WindowSum {
         self.vals.push_back(v);
         self.samps_since_last += 1;
 
-	assert!(self.vals.len() <= self.win_size);
-	if self.vals.len() == self.win_size {
-            if let Some(vo) = self.vals.front() {
-		self.sum -= vo.norm();
-		self.sum_sq -= vo.norm_sqr();
-            }
-	}
-
+        assert!(self.vals.len() <= self.win_size + 1);
         // Pop if already full
-        let res = if self.vals.len() == self.win_size {
-            Some(self.vals.pop_front().unwrap())
+        let res = if self.vals.len() == self.win_size + 1 {
+            let vo = self.vals.pop_front().unwrap();
+            self.sum -= vo.norm();
+            self.sum_sq -= vo.norm_sqr();
+            Some(vo)
         } else {
             None
         };
@@ -72,11 +68,17 @@ impl WindowSum {
         }
     }
 
-    fn std_dev(&self) -> f32 {
+    #[allow(dead_code)]
+    fn sum_sq(&self) -> f32 {
+        self.sum_sq
+    }
+
+    #[allow(dead_code)]
+    fn var(&self) -> f32 {
         if self.vals.len() == 0 {
             0.
         } else {
-            (self.sum_sq / self.vals.len() as f32 - self.avg() * self.avg()).sqrt()
+            self.sum_sq / self.vals.len() as f32 - self.avg() * self.avg()
         }
     }
 
@@ -109,6 +111,8 @@ pub struct PktDetector<'c> {
     config: &'c Config,
     /// Two sliding windows to do thresholding
     windows: (WindowSum, WindowSum),
+    /// Total number of samples seen so far
+    _samp_id: usize,
     /// State of the state machine for packet detector
     state: PktDetectorState,
 }
@@ -120,27 +124,37 @@ impl<'c> PktDetector<'c> {
         Self {
             config,
             windows: (WindowSum::new(n), WindowSum::new(n)),
+            _samp_id: 0,
             state: PktDetectorState::Silent,
         }
     }
 
     /// Indicator which we use to decide if a packet has started
     fn indicator(&self) -> f32 {
-        if self.windows.0.std_dev() == 0. {
-            if self.windows.1.avg() > 0. {
-                // The minimum value that'll pass the threshold
-                self.config.pkt_detect.thresh
+        // Computing the standard deviation from both windows keeps
+        // things smooth er than if we only include variance from
+        // windows.0, and makes sure tests pass
+        let std_dev = (0.5 * (self.windows.0.var() + self.windows.1.var())).sqrt();
+
+        if std_dev == 0. {
+            if self.windows.0.avg() != self.windows.1.avg() {
+                // Super unlikely event: both windows were perfectly
+                // constant, except for a jump. If there is an edge,
+                // this is definitely it
+                std::f32::MAX
             } else {
+                // Will be taken on almost every real case
                 0.
             }
         } else {
-            (self.windows.1.avg() - self.windows.0.avg()) / self.windows.0.std_dev()
+            (self.windows.1.avg() - self.windows.0.avg()) / std_dev
         }
     }
 
     /// Push a sample into the windows. Return true if we have enough
     /// samples to start detecting packets
     fn push_samp(&mut self, samp: Complex<f32>) -> bool {
+        self._samp_id += 1;
         // Put value in window
         if let Some(samp) = self.windows.1.push(samp) {
             if let Some(_) = self.windows.0.push(samp) {
@@ -169,11 +183,11 @@ impl<'c> PktDetector<'c> {
                 if indicator >= self.config.pkt_detect.thresh {
                     let mut pkt_samps = Vec::with_capacity(max_samples);
                     let (s1, s2) = self.windows.1.deque().as_slices();
-                    pkt_samps.push(*self.windows.0.deque().back().unwrap());
                     pkt_samps.extend(s1);
                     pkt_samps.extend(s2);
                     assert!(pkt_samps.len() <= max_samples);
-                    // The current `indicator` value corresponds to the 0th sample here
+                    // The current `indicator` value corresponds to
+                    // the 0th sample here
                     self.state = PktDetectorState::PktInProgress {
                         pkt_samps,
                         start_pos: 0,
@@ -204,37 +218,114 @@ impl<'c> PktDetector<'c> {
                     None
                 } else {
                     // Remove the portion of `pkt_samples` before pkt starts
-                    let res = pkt_samps.split_off(*start_pos).clone();
+                    let mut res = pkt_samps.split_off(*start_pos).clone();
+                    res.truncate(self.config.samps_per_pkt());
                     self.state = PktDetectorState::Silent;
                     Some(res)
                 }
             }
         }
     }
-
-    /// Given at-least `config.pkt_detect.num_samples` samples after
-    /// `Self::push` returned true, returns the sample index at which
-    /// the packet started
-    pub fn pkt_start_index(&mut self, samps: &[Complex<f32>]) -> usize {
-        // Warning: Ideally if indicator peaks at the current sample,
-        // we should return -1, but we return 0. This is an unlikely
-        // event in which case our answer will be 1 sample off. OFDM
-        // is more than capable of handling this much offset
-        let (mut max_indicator, mut max_idx) = (self.indicator(), 0);
-        // Start pushing the samples and find the index at which
-        // indicator peaks
-        for (i, samp) in samps
-            .iter()
-            .take(self.config.pkt_detect.num_samps)
-            .enumerate()
-        {
-            self.push_samp(*samp);
-            if self.indicator() > max_indicator {
-                max_indicator = self.indicator();
-                max_idx = i;
-            }
-        }
-        max_idx
-    }
 }
 
+#[cfg(test)]
+mod test {
+    use super::{PktDetector, WindowSum};
+    use crate::config::Config;
+
+    use num::Complex;
+    use rand::Rng;
+    use std::default::Default;
+
+    #[test]
+    fn window_sum() {
+        fn cplx(i: usize) -> Complex<f32> {
+            Complex::new(i as f32, 0.)
+        }
+
+        let l = 10;
+        let mut win = WindowSum::new(l);
+        // Add numbers 0..100
+        for i in 0..100 {
+            win.push(cplx(i));
+            if i > l {
+                let correct = i * (i + 1) / 2 - (i - l) * (i - l + 1) / 2;
+                assert_eq!((win.avg() * l as f32).round() as usize, correct);
+            }
+        }
+
+        // Add alternating 0s and 1s
+        for alt in 5..30 {
+            let mut win = WindowSum::new(l);
+            let mut correct = 0;
+            for i in 0..100 {
+                let val = (i / alt) % 2;
+                win.push(cplx(val));
+                correct += val;
+                if i >= l {
+                    correct -= ((i - l) / alt) % 2;
+                }
+                assert_eq!(
+                    (win.avg() * win.deque().len() as f32).round() as usize,
+                    correct
+                );
+            }
+        }
+    }
+
+    /// Takes a model of variation and tests
+    fn pkt_detect_base(variation: &mut dyn FnMut(usize) -> Complex<f32>) {
+        let config = Config::default();
+        let mut detector = PktDetector::new(&config);
+        let n = config.samps_per_pkt();
+        let mut num_pkts_detected = 0;
+        for i in 0..n * 9 {
+            let samp = if i % (2 * n) == n {
+                Complex::new(2., 0.)
+            } else if (i / n) % 2 == 1 {
+                Complex::new(0., 1.) + variation(i)
+            } else {
+                Complex::new(0., 0.) + variation(i)
+            };
+
+            if let Some(pkt_samps) = detector.push(samp) {
+                num_pkts_detected += 1;
+                assert_eq!(pkt_samps.len(), config.samps_per_pkt());
+                assert_eq!(pkt_samps[0], Complex::new(2., 0.));
+                for x in &pkt_samps[1..] {
+                    assert!((x - Complex::new(0., 1.)).norm() <= 0.11);
+                }
+            }
+        }
+        assert_eq!(num_pkts_detected, 4);
+    }
+
+    #[test]
+    fn pkt_detect_const() {
+        let mut variation = |_| Complex::new(0., 0.);
+        pkt_detect_base(&mut variation);
+        let mut variation = |_| Complex::new(0.05, 0.05);
+        pkt_detect_base(&mut variation);
+    }
+
+    #[test]
+    fn pkt_detect_variation_deterministic() {
+        // Deterministic
+        let mut variation = |i: usize| -> Complex<f32> {
+            if i % 2 == 1 {
+                Complex::new(0.1, 0.)
+            } else {
+                Complex::new(0., 0.)
+            }
+        };
+        pkt_detect_base(&mut variation);
+    }
+
+    #[test]
+    fn pkt_detect_variation_random() {
+        // Random
+        let mut rng = rand_pcg::Pcg32::new(1, 1);
+        let mut variation = |_| -> Complex<f32> { 0.01f32 * Complex::new(rng.gen(), rng.gen()) };
+        pkt_detect_base(&mut variation);
+    }
+}
