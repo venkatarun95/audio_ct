@@ -17,7 +17,7 @@ pub struct TestTx {
     /// The packet we'll transmit repeatedly
     pkt: Vec<Complex<f32>>,
     /// Number of more packets to transmit
-    num_pkts_left: usize,
+    num_pkts_left: Option<usize>,
     /// Number of samples of silence between transmissions
     silence_samps: usize,
 }
@@ -25,7 +25,7 @@ pub struct TestTx {
 impl TestTx {
     /// A test transmitter that will transmit `num_pkts` separated by
     /// `silence_samps` number of samples of silence
-    pub fn new(silence_samps: usize, num_pkts: usize, config: &Config) -> Self {
+    pub fn new(silence_samps: usize, num_pkts: Option<usize>, config: &Config) -> Self {
         // Construct a random packet for us to transmit repeatedly
         let mut rng = rand_pcg::Pcg32::new(0, 0);
         let pkt_data: Vec<bool> = (0..config.pkt.num_data_bits).map(|_| rng.gen()).collect();
@@ -48,7 +48,7 @@ impl TestTx {
 impl Iterator for TestTx {
     type Item = Complex<f32>;
     fn next(&mut self) -> Option<Complex<f32>> {
-        if self.num_pkts_left == 0 {
+        if Some(0) == self.num_pkts_left {
             return None;
         }
 
@@ -58,7 +58,9 @@ impl Iterator for TestTx {
             if self.pos >= cur_pkt.len() - 1 {
                 self.cur_pkt = None;
                 self.pos = 0;
-                self.num_pkts_left -= 1;
+		if let Some(n) = self.num_pkts_left.as_mut() {
+                    *n -= 1;
+		}
             } else {
                 self.pos += 1
             }

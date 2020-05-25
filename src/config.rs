@@ -2,6 +2,7 @@ use num::Complex;
 use rand::Rng;
 use std::default::Default;
 
+#[derive(Clone, Debug)]
 pub struct OfdmConfig {
     /// Number of frequency channels (number of OFDM symbols per OFDM channel)
     pub num_channels: usize,
@@ -9,6 +10,7 @@ pub struct OfdmConfig {
     pub cyclic_prefix_frac: usize,
 }
 
+#[derive(Clone, Debug)]
 pub struct PktDetectConfig {
     /// Number of samples used in the two averaging windows (should be
     /// even)
@@ -20,6 +22,7 @@ pub struct PktDetectConfig {
 }
 
 /// Configuration for how the packet is constructed
+#[derive(Clone, Debug)]
 pub struct PktConfig {
     /// Number of data bits per packet
     pub num_data_bits: usize,
@@ -29,10 +32,19 @@ pub struct PktConfig {
     pub pilot: Vec<Complex<f32>>,
 }
 
+/// Configuration for the audio frontend
+#[derive(Clone, Debug)]
+pub struct AudioConfig {
+    pub center_frequency: f32,
+    pub bandwidth: f32,
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub ofdm: OfdmConfig,
     pub pkt_detect: PktDetectConfig,
     pub pkt: PktConfig,
+    pub audio: AudioConfig,
 }
 
 impl OfdmConfig {
@@ -104,6 +116,10 @@ impl Default for Config {
                 num_bits: 512,
                 pilot,
             },
+	    audio: AudioConfig {
+		center_frequency: 5_000.,
+		bandwidth: 2_205.,
+	    }
         }
     }
 }
