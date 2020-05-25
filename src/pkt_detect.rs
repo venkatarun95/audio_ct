@@ -135,6 +135,7 @@ impl<'c> PktDetector<'c> {
         // things smooth er than if we only include variance from
         // windows.0, and makes sure tests pass
         let std_dev = (0.5 * (self.windows.0.var() + self.windows.1.var())).sqrt();
+	//println!("{} {} {} {}", self._samp_id, std_dev, self.windows.1.avg(), self.windows.0.avg());
 
         if std_dev == 0. {
             if self.windows.0.avg() != self.windows.1.avg() {
@@ -179,6 +180,7 @@ impl<'c> PktDetector<'c> {
         let indicator = self.indicator();
         match self.state {
             PktDetectorState::Silent => {
+		//println!("{} Silent: {} {}", self._samp_id, indicator, samp);
                 // if the indicator has met the threshold, change state
                 if indicator >= self.config.pkt_detect.thresh {
                     let mut pkt_samps = Vec::with_capacity(max_samples);
@@ -203,6 +205,7 @@ impl<'c> PktDetector<'c> {
                 ref mut cur_pos,
                 ref mut max_indicator,
             } => {
+		//println!("{} InProgress: {} {}", self._samp_id, indicator, samp);
                 if pkt_samps.len() < max_samples {
                     pkt_samps.push(samp);
                     *cur_pos += 1;

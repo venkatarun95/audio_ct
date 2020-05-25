@@ -80,9 +80,7 @@ impl Default for Config {
         // Let pilot be a (deterministic) random number
         let mut rng = rand_pcg::Pcg32::new(0, 0);
         let pilot_fft = (0..num_channels)
-            .map(|_| Complex::<f32>::new(rng.gen(), rng.gen()))
-            //.map(|_| Complex::new(1., 2. * std::f32::consts::PI * rng.gen::<f32>()))
-            //.map(|_| Complex::new(1f32, 0f32))
+            .map(|_| Complex::from_polar(&1., &(2. * std::f32::consts::PI * rng.gen::<f32>())))
             .collect::<Vec<_>>();
 
         // Perform IFFT
