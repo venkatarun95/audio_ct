@@ -101,7 +101,7 @@ where
     type Item = Complex<f32>;
     fn next(&mut self) -> Option<Complex<f32>> {
         if let Some(val) = self.tx.next() {
-            Some(val + 0. * Complex::<f32>::new(self.rng.gen(), self.rng.gen()))
+            Some(val + 0.1 * Complex::<f32>::new(self.rng.gen(), self.rng.gen()))
         } else {
             None
         }

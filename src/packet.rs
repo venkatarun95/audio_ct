@@ -50,7 +50,7 @@ impl<'a> TxOfdmSymbol<'a> {
         let mut res = Vec::new();
         let num_channels = self.config.ofdm.num_channels;
         let prefix_len = self.config.ofdm.prefix_len();
-        res.extend(&self.samples[num_channels - prefix_len - 1..]);
+        res.extend(&self.samples[num_channels - prefix_len..]);
         res.extend(&self.samples);
 
         res
@@ -195,6 +195,7 @@ pub fn construct_pkt(data: &[bool], config: &Config) -> Vec<Complex<f32>> {
         let start = symbol_id * config.ofdm.num_channels;
         let bpsk = encode_bpsk(&data[start..start + config.ofdm.num_channels]);
         let symbol = TxOfdmSymbol::new(&bpsk, config);
+	assert_eq!(data_samps.len(), symbol_id * config.ofdm.symbol_len());
         data_samps.append(&mut symbol.samps_with_cyclic_prefix());
     }
 
