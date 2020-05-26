@@ -10,13 +10,14 @@ const CHANNELS: i32 = 1;
 const FRAMES: u32 = 256;
 const INTERLEAVED: bool = true;
 
-fn run(
-    tx_receiver: Receiver<Complex<f32>>,
+fn run<'c, T>(
+    mut modulator: Modulate<'c, T>,
     rx_sender: Sender<f32>,
     sample_rate: f32,
-    center_frequency: f32,
-    bandwidth: f32,
-) -> Result<(), pa::Error> {
+) -> Result<(), pa::Error>
+where
+    T: Iterator<Item = Complex<f32>>,
+{
     let pa = pa::PortAudio::new()?;
 
     println!("PortAudio");
@@ -77,11 +78,6 @@ fn run(
         }
     };
 
-    // The sample we are currently sending through the speaker
-    let mut tx_samp = Complex::zero();
-    // Total number of samples sent so far
-    let mut num_sent_samples = 0u64;
-
     // Now start the main read/write loop! In this example, we pass
     // the input buffer directly to the output buffer, so watch out
     // for feedback.
@@ -109,24 +105,15 @@ fn run(
             // have less, just take what we can for now.
             let write_frames = out_frames;
             let n_write_samples = write_frames as usize * CHANNELS as usize;
-            let samps_to_skip = (sample_rate / bandwidth).round() as usize;
 
             stream.write(write_frames, |output| {
                 for i in 0..n_write_samples {
-                    // See if we need a new sample
-                    if num_sent_samples % samps_to_skip as u64 == 0 {
-                        tx_samp = tx_receiver.recv().unwrap();
+                    if let Some(samp) = modulator.next() {
+                        output[i] = samp;
+                    } else {
+                        println!("Tx samples finished. Exiting");
+                        break;
                     }
-
-                    let pi2 = 2. * std::f32::consts::PI;
-                    let e = Complex::new(
-                        0.,
-                        pi2 * (num_sent_samples / CHANNELS as u64) as f32 / sample_rate
-                            * center_frequency,
-                    )
-                    .exp();
-                    num_sent_samples += 1;
-                    output[i] = e.re * tx_samp.re + e.im * tx_samp.im;
                 }
             })?;
         }
@@ -134,17 +121,23 @@ fn run(
 }
 
 pub fn start_audio<'c>(
-    tx: Receiver<Complex<f32>>,
+    tx_receiver: Receiver<Complex<f32>>,
     config: &'c Config,
 ) -> Result<(std::thread::JoinHandle<()>, AudioSampleStream<'c>), Error> {
     // For the microphone
     let (rx_sender, rx_receiver) = std::sync::mpsc::channel::<f32>();
     let sample_rate = 44100.;
-    let center_frequency = config.audio.center_frequency;
-    let bandwidth = config.audio.bandwidth;
+    let config_c = config.clone();
 
     let handle = std::thread::spawn(move || {
-        run(tx, rx_sender, sample_rate, center_frequency, bandwidth).unwrap();
+        // Use the modulator to go from baseband to carrier frequency
+        let modulator = Modulate::new(tx_receiver.iter(), sample_rate, &config_c);
+        run(
+            modulator,
+            rx_sender,
+            sample_rate,
+        )
+        .unwrap();
     });
 
     return Ok((
@@ -156,11 +149,6 @@ pub fn start_audio<'c>(
 /// Stream of samples from an audio device
 pub struct AudioSampleStream<'c> {
     channel: Receiver<f32>,
-    // /// Number of samples per second that we'll receive from the microphone
-    // sample_rate: f32,
-    // /// Total number of baseband samples received so far
-    // samps_so_far: u64,
-    // config: &'c Config,
     demod: Demodulate<'c>,
 }
 
@@ -168,9 +156,6 @@ impl<'c> AudioSampleStream<'c> {
     fn new(channel: Receiver<f32>, sample_rate: f32, config: &'c Config) -> Self {
         Self {
             channel,
-            // sample_rate,
-            // samps_so_far: 0,
-            // config,
             demod: Demodulate::new(sample_rate, config),
         }
     }
@@ -242,7 +227,8 @@ where
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
         // See if we need to update the current sample
-        if self.cur_samp.is_some() && self.num_samps % self.to_skip as u64 == 0 {
+        if self.cur_samp.is_some() &&
+	    self.num_samps % self.to_skip as u64 == 0 {
             self.cur_samp = self.src.next();
         }
 
@@ -250,7 +236,8 @@ where
             let pi2 = 2. * std::f32::consts::PI;
             let e = Complex::new(
                 0.,
-                pi2 * self.num_samps as f32 / self.sample_rate * self.config.audio.center_frequency,
+                pi2 * self.num_samps as f32 / self.sample_rate *
+		    self.config.audio.center_frequency,
             )
             .exp();
             self.num_samps += 1;
@@ -297,7 +284,8 @@ impl<'c> Demodulate<'c> {
         let pi2 = 2. * std::f32::consts::PI;
         let e = Complex::new(
             0.,
-            pi2 * self.num_samps as f32 / self.sample_rate * self.config.audio.center_frequency,
+            pi2 * self.num_samps as f32 / self.sample_rate *
+		self.config.audio.center_frequency,
         )
         .exp();
         self.samp_avg += samp * e;
@@ -334,21 +322,25 @@ mod tests {
             .map(|_| Complex::new(rng.gen(), rng.gen()))
             .collect();
 
-        let modulate = Modulate::new(samples.clone().into_iter(), sample_rate, &config);
+        let modulate = Modulate::new(
+	    samples.clone().into_iter(),
+	    sample_rate,
+	    &config
+	);
         let mut demodulate = Demodulate::new(sample_rate, &config);
 
         let mut pos = 0;
-	let mut channel = None;
+        let mut channel = None;
         for x in modulate {
             if let Some(out) = demodulate.push(x) {
-		if channel.is_none() {
-		    channel = Some(out / samples[pos]);
-		}
-		let channel = channel.unwrap();
+                if channel.is_none() {
+                    channel = Some(out / samples[pos]);
+                }
+                let channel = channel.unwrap();
 
-		println!("{:?} {:?}", out.to_polar(), samples[pos].to_polar());
-		//println!("{} {}", out / samples[pos], channel);
-                //assert!((out / samples[pos] - channel).norm() <= 1e-3);
+                //println!("{:?} {:?}", out.to_polar(), samples[pos].to_polar());
+                //println!("{} {}", out / samples[pos], channel);
+                assert!((out / samples[pos] - channel).norm() <= 1e-3);
                 pos += 1;
             }
         }
