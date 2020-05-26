@@ -4,7 +4,6 @@ mod packet;
 mod pkt_detect;
 mod test;
 
-use audio::Audio;
 use config::Config;
 use packet::rx_loop;
 
@@ -22,7 +21,7 @@ fn main() {
     } else if args[1] == "audio" {
 	// Start up the audio devices
         let (sender, receiver) = std::sync::mpsc::channel();
-        let (_, mut rx) = Audio::new(receiver, &config).unwrap();
+        let (handle, mut rx) = audio::start_audio(receiver, &config).unwrap();
 
         // Sender
 	let config_c = config.clone();
@@ -35,6 +34,8 @@ fn main() {
 
 	// Receive loop
 	rx_loop(&mut rx, &config);
+
+    	handle.join().unwrap();
     } else {
         eprintln!("Usage: ./ofdm [test|audio]");
     }
