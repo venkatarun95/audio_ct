@@ -212,7 +212,6 @@ pub fn construct_pkt(data: &[bool], config: &Config) -> Vec<Complex<f32>> {
 pub fn rx_loop<I: InputSampleStream>(inp: &mut I, config: &Config) {
     let mut pkt_detector = PktDetector::new(config);
     while let Some(sample) = inp.next() {
-	println!("{}", sample);
         // Do packet detection
         let pkt_samps = if let Some(pkt_samps) = pkt_detector.push(sample) {
             pkt_samps

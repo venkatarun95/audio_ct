@@ -109,7 +109,7 @@ impl Default for Config {
             },
             pkt_detect: PktDetectConfig {
                 num_samps: 128,
-                thresh: 3.,
+                thresh: 2.,
             },
             pkt: PktConfig {
                 num_data_bits: 256,

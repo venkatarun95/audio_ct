@@ -134,7 +134,8 @@ impl<'c> PktDetector<'c> {
         // Computing the standard deviation from both windows keeps
         // things smooth er than if we only include variance from
         // windows.0, and makes sure tests pass
-        let std_dev = (0.5 * (self.windows.0.var() + self.windows.1.var())).sqrt();
+        //let std_dev = (0.5 * (self.windows.0.var() + self.windows.1.var())).sqrt();
+	let std_dev = self.windows.0.var().sqrt();
 	//println!("{} {} {} {}", self._samp_id, std_dev, self.windows.1.avg(), self.windows.0.avg());
 
         if std_dev == 0. {
@@ -178,6 +179,7 @@ impl<'c> PktDetector<'c> {
         // slack for detecting the packet
         let max_samples = self.config.samps_per_pkt() + self.config.pkt_detect.num_samps;
         let indicator = self.indicator();
+	//println!("{}", indicator);
         match self.state {
             PktDetectorState::Silent => {
 		//println!("{} Silent: {} {}", self._samp_id, indicator, samp);
