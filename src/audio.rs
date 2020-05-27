@@ -105,19 +105,24 @@ where
             // have less, just take what we can for now.
             let write_frames = out_frames;
             let n_write_samples = write_frames as usize * CHANNELS as usize;
-
+	    let mut flag = false;
             stream.write(write_frames, |output| {
                 for i in 0..n_write_samples {
                     if let Some(samp) = modulator.next() {
                         output[i] = samp;
                     } else {
                         println!("Tx samples finished. Exiting");
+			flag = true;
                         break;
                     }
                 }
             })?;
+	    if flag {
+		break;
+	    }
         }
     }
+    Ok(())
 }
 
 pub fn start_audio<'c>(
@@ -126,18 +131,13 @@ pub fn start_audio<'c>(
 ) -> Result<(std::thread::JoinHandle<()>, AudioSampleStream<'c>), Error> {
     // For the microphone
     let (rx_sender, rx_receiver) = std::sync::mpsc::channel::<f32>();
-    let sample_rate = 44100.;
+    let sample_rate = config.audio.sample_rate;
     let config_c = config.clone();
 
     let handle = std::thread::spawn(move || {
         // Use the modulator to go from baseband to carrier frequency
         let modulator = Modulate::new(tx_receiver.iter(), sample_rate, &config_c);
-        run(
-            modulator,
-            rx_sender,
-            sample_rate,
-        )
-        .unwrap();
+        run(modulator, rx_sender, sample_rate).unwrap();
     });
 
     return Ok((
@@ -190,13 +190,17 @@ where
     /// Our source of baseband samples
     src: T,
     /// Number of carrier samples to skip per baseband sample
-    to_skip: usize,
+    to_skip: u64,
     /// Sample rate of the audio signal
     sample_rate: f32,
     /// Total number of (audio) samples transmitted so far
     num_samps: u64,
-    /// The sample that we are currently sending
-    cur_samp: Option<Complex<f32>>,
+    /// If true, input is done and we'll always return None
+    done: bool,
+    /// The two samples we are currently in between sending
+    cur_samps: (Complex<f32>, Complex<f32>),
+    /// The current sample we are sending
+    cur_ewma: Complex<f32>,
 }
 
 impl<'c, T> Modulate<'c, T>
@@ -208,14 +212,16 @@ where
         // remove restriction later
         let to_skip = sample_rate / config.audio.bandwidth;
         assert!((to_skip.round() - to_skip).abs() <= 1e-3);
-        let to_skip = to_skip.round() as usize;
+        let to_skip = 1; //to_skip.round() as u64;
         Self {
             config,
             src,
             to_skip,
             sample_rate,
             num_samps: 0,
-            cur_samp: Some(Complex::zero()),
+            done: false,
+            cur_samps: (Complex::zero(), Complex::zero()),
+            cur_ewma: Complex::zero(),
         }
     }
 }
@@ -226,25 +232,41 @@ where
 {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        // See if we need to update the current sample
-        if self.cur_samp.is_some() &&
-	    self.num_samps % self.to_skip as u64 == 0 {
-            self.cur_samp = self.src.next();
+        if self.done {
+            return None;
         }
 
-        if let Some(cur_samp) = self.cur_samp {
-            let pi2 = 2. * std::f32::consts::PI;
-            let e = Complex::new(
-                0.,
-                pi2 * self.num_samps as f32 / self.sample_rate *
-		    self.config.audio.center_frequency,
-            )
-            .exp();
-            self.num_samps += 1;
-            Some(e.re * cur_samp.re + e.im * cur_samp.im)
-        } else {
-            None
+        // See if we need to update the current sample
+        if self.num_samps % self.to_skip == 0 {
+            if let Some(x) = self.src.next() {
+                self.cur_samps = (self.cur_samps.1, x);
+            } else {
+		self.done = true;
+		return None;
+	    }
         }
+
+        let pi2 = 2. * std::f32::consts::PI;
+        let e = Complex::new(
+            0.,
+            pi2 * self.num_samps as f32 / self.sample_rate * self.config.audio.center_frequency,
+        )
+        .exp();
+        self.num_samps += 1;
+
+        // Low-pass filter
+
+	// Frequency-domain sinc
+        //let f = (self.num_samps % self.to_skip) as f32 / self.to_skip as f32;
+        //let samp = prev * (1. - f) + cur * f;
+
+	// EWMA (equivalent to RC-filter)
+	// let alpha = 1. / (1. + self.to_skip as f32);
+	// self.cur_ewma = alpha * self.cur_samps.1 + (1. - alpha) * self.cur_ewma;
+	// let samp = self.cur_ewma;
+
+	let samp = self.cur_samps.1;
+        Some(e.re * samp.re + e.im * samp.im)
     }
 }
 
@@ -284,8 +306,7 @@ impl<'c> Demodulate<'c> {
         let pi2 = 2. * std::f32::consts::PI;
         let e = Complex::new(
             0.,
-            pi2 * self.num_samps as f32 / self.sample_rate *
-		self.config.audio.center_frequency,
+            pi2 * self.num_samps as f32 / self.sample_rate * self.config.audio.center_frequency,
         )
         .exp();
         self.samp_avg += samp * e;
@@ -322,11 +343,7 @@ mod tests {
             .map(|_| Complex::new(rng.gen(), rng.gen()))
             .collect();
 
-        let modulate = Modulate::new(
-	    samples.clone().into_iter(),
-	    sample_rate,
-	    &config
-	);
+        let modulate = Modulate::new(samples.clone().into_iter(), sample_rate, &config);
         let mut demodulate = Demodulate::new(sample_rate, &config);
 
         let mut pos = 0;

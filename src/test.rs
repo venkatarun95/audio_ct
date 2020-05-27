@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::packet::construct_pkt;
+use crate::packet::{construct_pkt, to_sample_rate};
 
 use num::{Complex, Zero};
 use rand::Rng;
@@ -33,7 +33,13 @@ impl TestTx {
             "Txed:\n{:?}",
             pkt_data.iter().map(|x| *x as u8).collect::<Vec<_>>()
         );
-        let pkt = construct_pkt(&pkt_data, config);
+        let base_pkt = construct_pkt(&pkt_data, config);
+	// Upconvert
+	let pkt = to_sample_rate(&base_pkt, config);
+
+	// Upconvert silence_samps to sample_rate
+	let silence_samps = (silence_samps as f32 * config.audio.sample_rate /
+			     config.audio.bandwidth) as usize;
 
         Self {
             cur_pkt: None,

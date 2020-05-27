@@ -99,71 +99,6 @@ impl<'a> RxOfdmSymbol<'a> {
     }
 }
 
-#[cfg(tests)]
-mod tests {
-    use super::{RxOfdmSymbol, TxOfdmSymbol};
-    use crate::config::Config;
-
-    use num::Complex;
-    use rand::Rng;
-
-    #[test]
-    /// Encode and decode a symbol using OFDM and ensure the result
-    /// is the same
-    fn ofdm_encode_decode() {
-        // Prepare the data
-        let config = Config::default();
-        let mut rng = rand_pcg::Pcg32::new(0, 0);
-        let symbols = (0..config.ofdm.num_channels)
-            .map(|_| Complex::<f32>::new(rng.gen(), rng.gen()))
-            .collect::<Vec<_>>();
-
-        // Simulate the tx and rx
-        let txed = TxOfdmSymbol::new(&symbols, &config);
-        let rxed = txed.samps_with_cyclic_prefix();
-        let rx = RxOfdmSymbol::new(&rxed[config.ofdm.prefix_len() + 1..], &config);
-
-        // See if they are equal
-        for (s, r) in symbols.iter().zip(rx.symbols()) {
-            assert!((s - r).norm() <= 1e-6);
-        }
-    }
-
-    /// Encode a symbol, then decode with varying amounts of delay and
-    /// see if it still works
-    #[test]
-    fn ofdm_encode_decode_delay() {
-        // Prepare the data
-        let config = Config::default();
-        let mut rng = rand_pcg::Pcg32::new(0, 0);
-        let symbols1 = (0..config.ofdm.num_channels)
-            .map(|_| Complex::<f32>::new(rng.gen(), rng.gen()))
-            .collect::<Vec<_>>();
-        let symbols2 = (0..config.ofdm.num_channels)
-            .map(|_| Complex::<f32>::new(rng.gen(), rng.gen()))
-            .collect::<Vec<_>>();
-
-        // Simulate the tx and rx
-        let txed1 = TxOfdmSymbol::new(&symbols1, &config);
-        let rxed1 = txed1.samps_with_cyclic_prefix();
-        let txed2 = TxOfdmSymbol::new(&symbols2, &config);
-        let rxed2 = txed2.samps_with_cyclic_prefix();
-
-        // Add different amounts of delay
-        for delay in 0..config.ofdm.prefix_len() {
-            let rx1 = RxOfdmSymbol::new(&rxed1[delay..delay + config.ofdm.num_channels], &config);
-            let rx2 = RxOfdmSymbol::new(&rxed2[delay..delay + config.ofdm.num_channels], &config);
-
-            // There should be a constant channel difference for all the symbols. See if they are equal
-            for i in 0..config.ofdm.num_channels {
-                let (s1, s2) = (symbols1[i], symbols2[i]);
-                let (r1, r2) = (rx1.symbols()[i], rx2.symbols()[i]);
-                assert!((s1 / r1 - s2 / r2).norm() < 1e-4);
-            }
-        }
-    }
-}
-
 pub fn encode_bpsk(data: &[bool]) -> Vec<Complex<f32>> {
     data.iter()
         .map(|b| {
@@ -196,7 +131,7 @@ pub fn construct_pkt(data: &[bool], config: &Config) -> Vec<Complex<f32>> {
         let start = symbol_id * config.ofdm.num_channels;
         let bpsk = encode_bpsk(&data[start..start + config.ofdm.num_channels]);
         let symbol = TxOfdmSymbol::new(&bpsk, config);
-	assert_eq!(data_samps.len(), symbol_id * config.ofdm.symbol_len());
+        assert_eq!(data_samps.len(), symbol_id * config.ofdm.symbol_len());
         data_samps.append(&mut symbol.samps_with_cyclic_prefix());
     }
 
@@ -207,6 +142,48 @@ pub fn construct_pkt(data: &[bool], config: &Config) -> Vec<Complex<f32>> {
     }
 
     res
+}
+
+/// Takes a stream in the transmission bandwidth, and upsamples it
+/// with low-pass filtering
+pub fn to_sample_rate(src: &[Complex<f32>], config: &Config) -> Vec<Complex<f32>> {
+    let factor = config.audio.sample_rate / config.audio.bandwidth;
+    let len = (factor * src.len() as f32).ceil() as usize;
+    // First construct the vector pre-lowpass-convolution
+    // Warning: The most horribly inefficient code possible
+    let mut upsampled = Vec::with_capacity(len);
+    for i in 0..len {
+        upsampled.push(src[(i as f32 / factor).floor() as usize]);
+    }
+
+    // Now do FFT, filter, then do inverse FFT
+    let mut planner = FFTplanner::new(false);
+    let fft = planner.plan_fft(len);
+    let mut fft_out = vec![Complex::zero(); len];
+    fft.process(&mut upsampled, &mut fft_out);
+
+    // Filter out the frequencies we don't want
+    for i in src.len()..len {
+        fft_out[i] = Complex::zero();
+    }
+
+    // Do the IFFT
+    let mut planner = FFTplanner::new(true);
+    let fft = planner.plan_fft(len);
+    fft.process(&mut fft_out, &mut upsampled);
+
+    // Normalize
+    let max = upsampled
+        .iter()
+        .fold(0., |m, x| if x.norm() > m { x.norm() } else { m });
+    println!("Max tx value: {}", max);
+
+    for x in &mut upsampled {
+        *x /= 3. * max;
+    }
+
+
+    upsampled
 }
 
 pub fn rx_loop<I: InputSampleStream>(inp: &mut I, config: &Config) {
@@ -270,5 +247,70 @@ pub fn rx_loop<I: InputSampleStream>(inp: &mut I, config: &Config) {
             "Tot data bits: {}, erreanous bits: {}",
             config.pkt.num_data_bits, num_wrong_bits
         );
+    }
+}
+
+#[cfg(tests)]
+mod tests {
+    use super::{RxOfdmSymbol, TxOfdmSymbol};
+    use crate::config::Config;
+
+    use num::Complex;
+    use rand::Rng;
+
+    #[test]
+    /// Encode and decode a symbol using OFDM and ensure the result
+    /// is the same
+    fn ofdm_encode_decode() {
+        // Prepare the data
+        let config = Config::default();
+        let mut rng = rand_pcg::Pcg32::new(0, 0);
+        let symbols = (0..config.ofdm.num_channels)
+            .map(|_| Complex::<f32>::new(rng.gen(), rng.gen()))
+            .collect::<Vec<_>>();
+
+        // Simulate the tx and rx
+        let txed = TxOfdmSymbol::new(&symbols, &config);
+        let rxed = txed.samps_with_cyclic_prefix();
+        let rx = RxOfdmSymbol::new(&rxed[config.ofdm.prefix_len() + 1..], &config);
+
+        // See if they are equal
+        for (s, r) in symbols.iter().zip(rx.symbols()) {
+            assert!((s - r).norm() <= 1e-6);
+        }
+    }
+
+    /// Encode a symbol, then decode with varying amounts of delay and
+    /// see if it still works
+    #[test]
+    fn ofdm_encode_decode_delay() {
+        // Prepare the data
+        let config = Config::default();
+        let mut rng = rand_pcg::Pcg32::new(0, 0);
+        let symbols1 = (0..config.ofdm.num_channels)
+            .map(|_| Complex::<f32>::new(rng.gen(), rng.gen()))
+            .collect::<Vec<_>>();
+        let symbols2 = (0..config.ofdm.num_channels)
+            .map(|_| Complex::<f32>::new(rng.gen(), rng.gen()))
+            .collect::<Vec<_>>();
+
+        // Simulate the tx and rx
+        let txed1 = TxOfdmSymbol::new(&symbols1, &config);
+        let rxed1 = txed1.samps_with_cyclic_prefix();
+        let txed2 = TxOfdmSymbol::new(&symbols2, &config);
+        let rxed2 = txed2.samps_with_cyclic_prefix();
+
+        // Add different amounts of delay
+        for delay in 0..config.ofdm.prefix_len() {
+            let rx1 = RxOfdmSymbol::new(&rxed1[delay..delay + config.ofdm.num_channels], &config);
+            let rx2 = RxOfdmSymbol::new(&rxed2[delay..delay + config.ofdm.num_channels], &config);
+
+            // There should be a constant channel difference for all the symbols. See if they are equal
+            for i in 0..config.ofdm.num_channels {
+                let (s1, s2) = (symbols1[i], symbols2[i]);
+                let (r1, r2) = (rx1.symbols()[i], rx2.symbols()[i]);
+                assert!((s1 / r1 - s2 / r2).norm() < 1e-4);
+            }
+        }
     }
 }
